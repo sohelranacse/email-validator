@@ -6,3 +6,6 @@ email_list.txt
 checked_email.txt
 /.puku
 actual_email.txt
+/build
+Email-validator.zip
+Email_Validator.spec
