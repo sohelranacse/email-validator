@@ -1,526 +1,1312 @@
-# ============================================================
-# Auto-install dependencies on first run / new PC
-# This runs BEFORE any third-party imports so it can fix itself.
-# ============================================================
+# =============================================================
+# Email Validator — Flask app with parallel SMTP verification
+# Auto-installs missing dependencies on first run.
+# =============================================================
 import sys
 import subprocess
 import importlib.util
 import os
 
+
 def _ensure_dependencies():
-    """
-    If key packages are missing, auto-install from requirements.txt.
-    Then re-exec the script so the newly installed packages become importable.
-    This makes the app "just work" on a brand new Windows PC.
-    """
-    # Check the packages we actually import (import names, not pip names)
-    packages_to_check = [
-        ("flask", "flask"),
-        ("dns", "dnspython"),
-        ("email_validator", "email-validator"),
-    ]
-
-    missing = []
-    for import_name, pip_name in packages_to_check:
-        if importlib.util.find_spec(import_name) is None:
-            missing.append(pip_name)
-
+    """Install missing packages from requirements.txt, then restart."""
+    required = [("flask", "flask"), ("dns", "dnspython"), ("email_validator", "email-validator")]
+    missing = [pip for imp, pip in required if importlib.util.find_spec(imp) is None]
     if not missing:
-        return  # All good, continue normally
+        return
 
     req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
-    print("📦 Missing dependencies detected on this machine:")
-    print("   " + ", ".join(missing))
-    print("   Installing from requirements.txt (this only happens once)...\n")
-
+    print(f"Missing packages: {', '.join(missing)}\nInstalling from requirements.txt...\n")
     try:
-        # Use the exact same Python interpreter that launched this script
-        cmd = [sys.executable, "-m", "pip", "install", "-r", req_file]
-        subprocess.check_call(cmd)
-        print("\n✅ Dependencies installed successfully.")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req_file])
+        print("\nDependencies installed. Restarting...\n")
     except subprocess.CalledProcessError as e:
-        print("\n❌ Automatic installation failed.")
-        print(f"   Error code: {e.returncode}")
-        print("\nPlease run this command manually in your terminal, then start the app again:")
-        print(f'   "{sys.executable}" -m pip install -r requirements.txt')
+        print(f"\nAuto-install failed (code {e.returncode}).")
+        print(f"Run manually:  {sys.executable} -m pip install -r requirements.txt")
         sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Unexpected error during auto-install: {e}")
-        sys.exit(1)
-
-    # Re-spawn the current process so the freshly installed packages are importable.
-    # This is the most reliable cross-platform way.
-    print("🔄 Restarting the application with the new packages...\n")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 _ensure_dependencies()
-# From this point on it is safe to import third-party packages.
 
-from flask import Flask, render_template_string, request, Response, send_from_directory
+# --- Third-party imports (safe after dependency check) ---
+from flask import Flask, render_template_string, request, Response, send_from_directory, jsonify
 import json
 import time
 import threading
 import random
 import socket
 import smtplib
+import uuid
 import dns.resolver
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email_validator import validate_email, EmailNotValidError
 
+# =============================================================
+# App setup
+# =============================================================
 app = Flask(__name__)
 
-# Global caches and locks for thread safety + speed
-mx_cache = {}
-mx_lock = threading.Lock()
-catch_all_cache = {}
-catch_all_lock = threading.Lock()
-file_lock = threading.Lock()
+# Thread-safe caches
+_mx_cache: dict = {}
+_mx_lock = threading.Lock()
+_catch_cache: dict = {}
+_catch_lock = threading.Lock()
+_file_lock = threading.Lock()
 
+# Session cancel events: session_id -> threading.Event
+_cancel_events: dict = {}
+_cancel_lock = threading.Lock()
+
+# Realistic EHLO name (reduces server rejections compared to "localhost")
+EHLO_NAME = "mail.outbound-relay.net"
+
+# Major providers that intentionally block unauthenticated SMTP probes.
+# For these, valid syntax + live MX record is treated as "likely valid".
+PROBE_BLOCKING_PROVIDERS = {
+    # Google
+    "gmail.com", "googlemail.com",
+    # Yahoo / AOL
+    "yahoo.com", "yahoo.co.uk", "yahoo.co.in", "yahoo.com.br",
+    "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.it", "yahoo.ca",
+    "yahoo.com.au", "yahoo.co.jp", "ymail.com", "rocketmail.com",
+    "aol.com", "aim.com",
+    # Microsoft
+    "outlook.com", "hotmail.com", "live.com", "msn.com",
+    "hotmail.co.uk", "hotmail.fr", "hotmail.de", "live.co.uk",
+    "outlook.co.id", "outlook.jp", "outlook.kr", "outlook.de",
+    "outlook.fr", "outlook.es", "hotmail.es", "hotmail.it",
+    "live.fr", "live.de", "live.nl", "live.it",
+    # Apple
+    "icloud.com", "me.com", "mac.com",
+    # Others
+    "protonmail.com", "proton.me", "pm.me",
+    "zoho.com", "zohomail.com",
+    "yandex.com", "yandex.ru",
+    "gmx.com", "gmx.net", "gmx.de",
+    "web.de", "mail.ru",
+    "fastmail.com", "fastmail.fm",
+    "tutanota.com", "tutamail.com", "tuta.io",
+    "hey.com",
+}
+
+
+# =============================================================
+# Rate limiter — avoids hammering a single domain
+# =============================================================
 class DomainRateLimiter:
-    """Prevents hammering any single domain (reduces blocks/bans)."""
-    def __init__(self, min_interval=0.28):
+    def __init__(self, min_interval: float = 0.15):
         self.min_interval = min_interval
-        self.last_check = {}
-        self.lock = threading.Lock()
+        self._last: dict = {}
+        self._lock = threading.Lock()
 
-    def wait_for(self, domain):
-        sleep_time = 0.0
-        with self.lock:
+    def wait(self, domain: str):
+        with self._lock:
             now = time.time()
-            last = self.last_check.get(domain, 0.0)
-            elapsed = now - last
-            if elapsed < self.min_interval:
-                sleep_time = self.min_interval - elapsed
-            self.last_check[domain] = now + sleep_time
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-        with self.lock:
-            self.last_check[domain] = time.time()
+            wait_sec = max(0.0, self.min_interval - (now - self._last.get(domain, 0.0)))
+            self._last[domain] = now + wait_sec
+        if wait_sec:
+            time.sleep(wait_sec)
+        with self._lock:
+            self._last[domain] = time.time()
 
-rate_limiter = DomainRateLimiter(min_interval=0.28)
 
-def get_mx_server(domain):
-    """Get best MX server for domain (with A-record fallback). Thread-safe cache."""
-    with mx_lock:
-        if domain in mx_cache:
-            return mx_cache[domain]
+_rate_limiter = DomainRateLimiter()
 
-    mx_server = None
+# Custom DNS resolver with shorter timeout
+_dns_resolver = dns.resolver.Resolver()
+_dns_resolver.timeout = 3
+_dns_resolver.lifetime = 5
+
+
+# =============================================================
+# DNS helpers
+# =============================================================
+def get_mx_server(domain: str) -> str | None:
+    """Return the best MX hostname for domain (with A-record fallback). Cached."""
+    with _mx_lock:
+        if domain in _mx_cache:
+            return _mx_cache[domain]
+
+    result = None
     try:
-        answers = dns.resolver.resolve(domain, 'MX')
-        mx_server = sorted(answers, key=lambda r: r.preference)[0].exchange.to_text().rstrip('.')
+        records = _dns_resolver.resolve(domain, "MX")
+        result = sorted(records, key=lambda r: r.preference)[0].exchange.to_text().rstrip(".")
     except Exception:
-        # Fallback: try A record (some domains deliver directly)
         try:
-            dns.resolver.resolve(domain, 'A')
-            mx_server = domain
+            _dns_resolver.resolve(domain, "A")
+            result = domain  # domain acts as its own mail server
         except Exception:
-            mx_server = None
+            result = None
 
-    with mx_lock:
-        mx_cache[domain] = mx_server
-    return mx_server
+    with _mx_lock:
+        _mx_cache[domain] = result
+    return result
 
 
-def is_catch_all_domain(mx_server, domain):
-    """Probe with a clearly bogus address. If accepted too -> catch-all domain."""
-    with catch_all_lock:
-        if domain in catch_all_cache:
-            return catch_all_cache[domain]
+def prewarm_mx_cache(domains: list[str], max_workers: int = 30):
+    """Batch-resolve MX records for all unique domains before SMTP probes."""
+    unresolved = []
+    with _mx_lock:
+        for d in domains:
+            if d not in _mx_cache:
+                unresolved.append(d)
 
-    bogus = f"no-such-user-{random.randint(10000000, 99999999)}@{domain}"
-    is_catch = False
+    if not unresolved:
+        return
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(unresolved))) as pool:
+        pool.map(get_mx_server, unresolved)
+
+
+# =============================================================
+# Low-level SMTP probe
+# =============================================================
+def _smtp_probe(host: str, port: int, mail_from: str, rcpt_to: str, timeout: int = 10):
+    """
+    Open an SMTP connection and perform EHLO + optional STARTTLS + MAIL FROM + RCPT TO.
+    Returns (smtp_code, response_text, banner_text).
+    Raises any exception on connection/protocol failure.
+    """
+    server = smtplib.SMTP(timeout=timeout)
+    server.connect(host, port)
+    banner = (server.welcome or b"").decode(errors="ignore").strip()[:80]
+    server.ehlo(EHLO_NAME)
+    if server.has_extn("starttls"):
+        try:
+            server.starttls()
+            server.ehlo(EHLO_NAME)
+        except Exception:
+            pass
+    server.mail(mail_from)
+    code, msg = server.rcpt(rcpt_to)
     try:
-        server = smtplib.SMTP(timeout=8)
-        server.connect(mx_server, 25)
-        server.ehlo()
-        server.mail('validator@check.local')
-        code, _ = server.rcpt(bogus)
         server.quit()
-        is_catch = (code == 250)
     except Exception:
-        is_catch = False
-
-    with catch_all_lock:
-        catch_all_cache[domain] = is_catch
-    return is_catch
+        pass
+    text = (msg.decode(errors="ignore") if isinstance(msg, (bytes, bytearray)) else str(msg)).strip()[:90]
+    return code, text, banner
 
 
-def verify_email_delivery(email, detect_catch_all=True):
+# =============================================================
+# Catch-all detection
+# =============================================================
+def is_catch_all(host: str, domain: str) -> bool:
     """
-    Best-effort REAL mailbox verification:
-    1. Strict syntax (email-validator lib)
-    2. MX / mail server lookup
-    3. Direct SMTP RCPT TO handshake (the gold standard for "does this mailbox exist?")
-    4. Catch-all probe when enabled (highly recommended for accuracy)
+    Probe with a random bogus address.
+    If the server accepts it (250), the domain is catch-all.
+    Result is cached per domain.
     """
-    # 1. Syntax validation (far superior to regex)
+    with _catch_lock:
+        if domain in _catch_cache:
+            return _catch_cache[domain]
+
+    bogus = f"no-such-user-{random.randint(10_000_000, 99_999_999)}@{domain}"
+    result = False
+    for port in (25, 587):
+        try:
+            code, _, _ = _smtp_probe(host, port, f"postmaster@{domain}", bogus, timeout=6)
+            result = (code == 250)
+            break
+        except Exception:
+            continue
+
+    with _catch_lock:
+        _catch_cache[domain] = result
+    return result
+
+
+# =============================================================
+# Main verification logic
+# =============================================================
+def verify_email(email: str, detect_catch_all: bool = True) -> tuple[str, str]:
+    """
+    Verify a single email address.
+
+    Returns (status, detail_message) where status is one of:
+      valid         — SMTP 250 confirmed
+      likely_valid  — Known provider blocks probes; syntax + MX look good
+      catch_all     — Domain accepts all addresses (cannot confirm individually)
+      invalid       — Bad syntax, no MX, or SMTP 5xx rejection
+      undetermined  — Server connected but dropped probe without clear answer
+      unknown       — Unexpected error
+    """
+    # 1. Syntax check
     try:
         validate_email(email, check_deliverability=False)
     except EmailNotValidError:
-        return "invalid_syntax", "Bad email syntax"
+        return "invalid", "Bad email syntax"
 
-    domain = email.rsplit('@', 1)[-1].lower().strip()
+    domain = email.rsplit("@", 1)[-1].lower()
     if not domain:
-        return "invalid_syntax", "Missing domain"
+        return "invalid", "Missing domain part"
 
-    # 2. MX lookup
-    mx_server = get_mx_server(domain)
-    if not mx_server:
-        return "no_mx", "Domain has no mail servers (no MX/A records)"
+    # 2. MX / A record lookup
+    mx = get_mx_server(domain)
+    if not mx:
+        return "invalid", "No mail server found (no MX or A record)"
 
-    # 3. Rate limit + SMTP verification
-    rate_limiter.wait_for(domain)
+    known_blocker = domain in PROBE_BLOCKING_PROVIDERS
 
-    try:
-        server = smtplib.SMTP(timeout=12)
-        server.connect(mx_server, 25)
-        server.ehlo()
-        # STARTTLS is optional; many public MXes work without. Uncomment if desired:
-        # try:
-        #     server.starttls()
-        #     server.ehlo()
-        # except Exception:
-        #     pass
+    # 3. SMTP probe — port 25 (two sender variants), then port 587
+    _rate_limiter.wait(domain)
 
-        server.mail('validator@check.local')
-        code, message = server.rcpt(email)
-        server.quit()
+    probe_plan = [
+        (25,  f"postmaster@{domain}"),
+        (25,  ""),
+        (587, f"postmaster@{domain}"),
+    ]
+    last_error = ("unknown", "Could not complete verification")
+    banner = ""
 
-        msg_text = (message.decode(errors='ignore') if isinstance(message, (bytes, bytearray)) else str(message)).strip()[:90]
+    for attempt, (port, mail_from) in enumerate(probe_plan):
+        if attempt > 0:
+            _rate_limiter.wait(domain)
 
-        if code == 250:
-            if detect_catch_all:
-                if is_catch_all_domain(mx_server, domain):
-                    return "catch_all", "Catch-all domain (accepts mail to any address)"
-            return "valid", "Mailbox exists and accepts mail (SMTP 250)"
-        elif code in (550, 551, 553, 554):
-            return "mailbox_invalid", f"Mailbox does not exist ({code})"
-        elif code in (450, 451, 452):
-            return "temp_error", f"Temporary rejection / rate limit ({code})"
-        else:
-            return "smtp_error", f"SMTP response {code}: {msg_text}"
+        try:
+            code, msg_text, banner = _smtp_probe(mx, port, mail_from, email, timeout=10)
 
-    except smtplib.SMTPConnectError as e:
-        return "connection_error", f"Connection refused/blocked ({str(e)[:65]})"
-    except (socket.timeout, TimeoutError):
-        return "timeout", "Timeout connecting or waiting for server"
-    except smtplib.SMTPServerDisconnected:
-        return "connection_error", "Server disconnected unexpectedly"
-    except Exception as e:
-        return "unknown", f"Unexpected error: {str(e)[:65]}"
+            if code == 250:
+                if detect_catch_all and is_catch_all(mx, domain):
+                    return "catch_all", "Catch-all domain — accepts mail to any address"
+                return "valid", f"Mailbox confirmed (SMTP 250, port {port})"
+            elif code in (550, 551, 553, 554):
+                return "invalid", f"Mailbox rejected by server (SMTP {code})"
+            elif code == 552:
+                return "valid", f"Mailbox exists but is full (SMTP 552, port {port})"
+            elif code == 541:
+                return "invalid", f"Rejected by recipient policy (SMTP 541)"
+            elif code == 421:
+                return "undetermined", f"Service temporarily unavailable (SMTP 421) — retry later"
+            elif code in (450, 451, 452):
+                return "undetermined", f"Temporary server rejection (SMTP {code}) — try again later"
+            else:
+                return "undetermined", f"Unexpected SMTP response {code}: {msg_text}"
 
-# --- HTML UI Interface ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+        except smtplib.SMTPConnectError as e:
+            last_error = ("undetermined", f"Port {port} refused/unreachable: {str(e)[:60]}")
+            continue
+        except (socket.timeout, TimeoutError):
+            reason = (
+                "Port 25 may be blocked by your ISP."
+                if port == 25
+                else "Port 587 requires AUTH; unauthenticated probes timeout."
+            )
+            last_error = ("undetermined", f"Timeout on port {port}. {reason} Banner: {banner or 'none'}")
+            continue
+        except smtplib.SMTPServerDisconnected:
+            last_error = (
+                "undetermined",
+                f"Server dropped connection on port {port} after MAIL FROM "
+                f"(sender={mail_from or '<>'}, banner: {banner or 'none'})",
+            )
+            continue
+        except Exception as e:
+            last_error = ("unknown", f"Error on port {port}: {str(e)[:70]}")
+            continue
+
+    # 4. All probes exhausted — known provider fallback
+    if known_blocker:
+        return (
+            "likely_valid",
+            f"{domain} is a major provider that blocks SMTP probes from external IPs. "
+            "Syntax ✓  MX ✓ — address is very likely valid.",
+        )
+
+    return last_error
+
+
+# =============================================================
+# HTML / CSS / JS UI
+# =============================================================
+HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Best Real Email Validator • Parallel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <title>Email Validator — High Performance</title>
+    <meta name="description" content="Validate up to 50,000+ emails with real-time SMTP verification, DNS MX lookup, and catch-all detection. Fast, accurate, cancellable.">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        body { background-color: #f4f6f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .card { border: none; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-radius: 12px; }
-        #logConsole { background-color: #111; color: #00ff66; font-family: 'Courier New', Courier, monospace; height: 340px; overflow-y: auto; padding: 14px; border-radius: 8px; font-size: 13.5px; line-height: 1.35; }
-        .stat-badge { font-size: 0.9rem; padding: 6px 10px; }
-        .log-valid { color: #2ecc71; }
-        .log-catch { color: #f1c40f; }
-        .log-invalid { color: #ff5e5e; }
-        .log-unknown { color: #95a5a6; }
-        .form-range {
-            accent-color: #0f766e;
-            height: 5px;
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #111827;
+            --bg-card: #1a1f35;
+            --bg-card-hover: #1f2541;
+            --bg-input: #0d1225;
+            --border: #2a3155;
+            --border-focus: #6366f1;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent: #6366f1;
+            --accent-glow: rgba(99, 102, 241, 0.25);
+            --green: #22c55e;
+            --green-soft: #86efac;
+            --green-bg: rgba(34, 197, 94, 0.12);
+            --yellow: #eab308;
+            --yellow-bg: rgba(234, 179, 8, 0.12);
+            --red: #ef4444;
+            --red-bg: rgba(239, 68, 68, 0.12);
+            --orange: #f97316;
+            --orange-bg: rgba(249, 115, 22, 0.12);
+            --blue: #3b82f6;
+            --blue-bg: rgba(59, 130, 246, 0.12);
+            --cyan: #22d3ee;
         }
-        .workers-box {
-            background: linear-gradient(145deg, #f8fafc, #f1f5f9);
-            border: 1px solid #e2e8f0;
-            border-radius: 10px;
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: 'Inter', -apple-system, sans-serif;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Animated background */
+        body::before {
+            content: '';
+            position: fixed;
+            top: -50%; left: -50%;
+            width: 200%; height: 200%;
+            background: radial-gradient(ellipse at 20% 50%, rgba(99,102,241,0.06) 0%, transparent 50%),
+                        radial-gradient(ellipse at 80% 20%, rgba(139,92,246,0.04) 0%, transparent 50%),
+                        radial-gradient(ellipse at 50% 80%, rgba(59,130,246,0.04) 0%, transparent 50%);
+            animation: bgShift 20s ease-in-out infinite alternate;
+            z-index: 0;
+        }
+        @keyframes bgShift {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(-3%, -3%); }
+        }
+
+        .app-container {
+            position: relative;
+            z-index: 1;
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 24px 20px 40px;
+        }
+
+        /* Header */
+        .app-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 24px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+        .app-header h1 {
+            font-size: 1.65rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #c7d2fe, #6366f1, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+        .header-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: var(--cyan);
+            background: rgba(34, 211, 238, 0.08);
+            border: 1px solid rgba(34, 211, 238, 0.2);
+            padding: 5px 12px;
+            border-radius: 20px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        /* Card */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 16px;
+            transition: border-color 0.3s ease;
+        }
+        .card:hover { border-color: rgba(99,102,241,0.3); }
+
+        .card-title {
+            font-size: 0.82rem;
+            font-weight: 700;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-title .icon { font-size: 1rem; }
+
+        /* Controls grid */
+        .controls-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 2fr;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        @media (max-width: 768px) {
+            .controls-grid { grid-template-columns: 1fr; }
+        }
+
+        .control-group label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        input[type="number"] {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1rem;
+            font-weight: 600;
             padding: 10px 14px;
-            margin-bottom: 2px;
+            border-radius: 10px;
+            width: 90px;
+            text-align: center;
+            transition: all 0.2s;
+            outline: none;
         }
+        input[type="number"]:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        /* Toggle switch */
+        .toggle-wrap {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 4px;
+        }
+        .toggle {
+            position: relative;
+            width: 44px;
+            height: 24px;
+            cursor: pointer;
+        }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle-track {
+            position: absolute;
+            inset: 0;
+            background: #334155;
+            border-radius: 12px;
+            transition: background 0.3s;
+        }
+        .toggle input:checked + .toggle-track { background: var(--accent); }
+        .toggle-knob {
+            position: absolute;
+            top: 3px; left: 3px;
+            width: 18px; height: 18px;
+            background: #fff;
+            border-radius: 50%;
+            transition: transform 0.3s;
+            pointer-events: none;
+        }
+        .toggle input:checked ~ .toggle-knob { transform: translateX(20px); }
+        .toggle-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        /* Buttons */
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 11px 22px;
+            border-radius: 10px;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 700;
+            cursor: pointer;
+            border: none;
+            transition: all 0.25s ease;
+            letter-spacing: 0.2px;
+        }
+        .btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+        .btn-start {
+            background: linear-gradient(135deg, #22c55e, #16a34a);
+            color: #fff;
+            flex: 1;
+            justify-content: center;
+            box-shadow: 0 4px 15px rgba(34,197,94,0.25);
+        }
+        .btn-start:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(34,197,94,0.35);
+        }
+        .btn-cancel {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: #fff;
+            flex: 1;
+            justify-content: center;
+            box-shadow: 0 4px 15px rgba(239,68,68,0.25);
+            display: none;
+        }
+        .btn-cancel:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(239,68,68,0.35);
+        }
+        .btn-cancel.cancelling {
+            background: linear-gradient(135deg, #9333ea, #7c3aed);
+            box-shadow: 0 4px 15px rgba(147,51,234,0.25);
+        }
+        .btn-load {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+        .btn-load:hover:not(:disabled) {
+            border-color: var(--accent);
+            color: var(--text-primary);
+            transform: translateY(-1px);
+        }
+
+        /* Textarea */
+        .email-textarea {
+            width: 100%;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.82rem;
+            line-height: 1.55;
+            padding: 16px;
+            border-radius: 12px;
+            resize: vertical;
+            min-height: 160px;
+            outline: none;
+            transition: all 0.2s;
+        }
+        .email-textarea:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+        .email-textarea::placeholder { color: var(--text-muted); }
+
+        .email-count {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 6px;
+            font-weight: 500;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .email-count strong { color: var(--accent); }
+
+        /* Progress section */
+        .progress-section {
+            margin-top: 20px;
+            display: none;
+        }
+        .progress-section.active { display: block; }
+
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .progress-status {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+        .progress-status.running { color: var(--cyan); }
+        .progress-status.finished { color: var(--green); }
+        .progress-status.cancelled { color: var(--orange); }
+        .progress-counter {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .progress-track {
+            height: 8px;
+            background: var(--bg-input);
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #6366f1, #818cf8, #a78bfa);
+            border-radius: 8px;
+            transition: width 0.3s ease;
+            position: relative;
+        }
+        .progress-fill::after {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
+            animation: shimmer 2s infinite;
+        }
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .speed-row {
+            display: flex;
+            gap: 20px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+            margin-bottom: 14px;
+        }
+        .speed-row span strong { color: var(--text-secondary); }
+
+        /* Stats grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 8px;
+            margin-bottom: 0;
+        }
+        .stat-card {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-size: 0.78rem;
+            font-weight: 600;
+        }
+        .stat-card .stat-count {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.15rem;
+            font-weight: 800;
+        }
+        .stat-valid     { background: var(--green-bg); color: var(--green); }
+        .stat-likely    { background: rgba(134,239,172,0.1); color: var(--green-soft); }
+        .stat-catch     { background: var(--yellow-bg); color: var(--yellow); }
+        .stat-invalid   { background: var(--red-bg); color: var(--red); }
+        .stat-undet     { background: var(--orange-bg); color: var(--orange); }
+        .stat-unknown   { background: rgba(148,163,184,0.1); color: var(--text-secondary); }
+        .stat-total     { background: var(--blue-bg); color: var(--blue); }
+
+        /* Log console */
+        .log-console {
+            background: #060a15;
+            border: 1px solid rgba(99,102,241,0.15);
+            border-radius: 12px;
+            padding: 0;
+            height: 400px;
+            overflow: hidden;
+            position: relative;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.78rem;
+            line-height: 1.5;
+        }
+        .log-inner {
+            height: 100%;
+            overflow-y: auto;
+            padding: 14px 16px;
+            scroll-behavior: smooth;
+        }
+        .log-inner::-webkit-scrollbar { width: 6px; }
+        .log-inner::-webkit-scrollbar-track { background: transparent; }
+        .log-inner::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        .log-entry {
+            padding: 2px 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .log-valid   { color: #4ade80; }
+        .log-likely  { color: #86efac; }
+        .log-catch   { color: #facc15; }
+        .log-invalid { color: #f87171; }
+        .log-undet   { color: #fb923c; }
+        .log-unknown { color: #94a3b8; }
+        .log-system  { color: #38bdf8; }
+        .log-done    { color: #facc15; font-weight: 700; }
+
+        .log-cap-notice {
+            position: absolute;
+            bottom: 0; left: 0; right: 0;
+            background: linear-gradient(transparent, #060a15 70%);
+            padding: 20px 16px 10px;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            text-align: center;
+            pointer-events: none;
+        }
+
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .btn-clear {
+            font-size: 0.7rem;
+            padding: 4px 10px;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .btn-clear:hover {
+            border-color: var(--accent);
+            color: var(--text-primary);
+        }
+
+        /* Downloads */
+        .downloads-section {
+            display: none;
+        }
+        .downloads-section.active { display: block; }
+
+        .download-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 8px;
+        }
+        .dl-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.78rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .dl-btn:hover {
+            border-color: var(--accent);
+            color: var(--text-primary);
+            transform: translateY(-1px);
+        }
+        .dl-btn .dl-icon { font-size: 1.1rem; }
+        .dl-btn .dl-sub {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+            font-weight: 400;
+        }
+
+        .note-text {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            margin-top: 10px;
+            line-height: 1.5;
+        }
+        .note-text strong { color: var(--text-secondary); }
+
+        /* Pulse animation for running status */
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .pulse { animation: pulse 1.5s ease-in-out infinite; }
     </style>
 </head>
 <body>
-    <div class="container py-4">
-        <div class="row justify-content-center">
-            <div class="col-lg-11 col-xl-10">
-                <div class="card p-4 mb-3">
-                    <div class="d-flex align-items-center justify-content-between mb-2">
-                        <h3 class="mb-0 text-dark fw-bold">📧 Best Real Email Validator</h3>
-                        <span class="badge bg-dark">Parallel • MX + SMTP RCPT + Catch-All</span>
-                    </div>
-                    <p class="text-muted small mb-3">True mailbox existence check using DNS MX + direct SMTP handshake (no email is sent). Catch-all detection for maximum accuracy.</p>
+<div class="app-container">
 
-                    <!-- Controls -->
-                    <div class="row g-3 align-items-end mb-3">
-                        <!-- Workers -->
-                        <div class="col-md-4">
-                            <div class="workers-box">
-                                <label class="form-label fw-semibold small mb-1">Parallel Workers <span class="text-secondary">(3–10)</span></label>
-                                <div class="d-flex align-items-center gap-2">
-                                    <input type="range" class="form-range flex-grow-1" id="workersRange" min="3" max="10" step="1" value="5">
-                                    <input type="number" id="workersInput" class="form-control form-control-sm text-center" style="width: 62px" min="3" max="10" value="5">
-                                </div>
-                                <div class="form-text tiny text-secondary">More workers = faster but higher risk of temporary blocks</div>
-                            </div>
-                        </div>
+    <!-- Header -->
+    <header class="app-header">
+        <h1>⚡ Email Validator</h1>
+        <span class="header-badge">
+            <span>●</span> MX + SMTP + Catch-All
+        </span>
+    </header>
 
-                        <!-- Catch-all -->
-                        <div class="col-md-3">
-                            <div class="form-check form-switch mt-1">
-                                <input class="form-check-input" type="checkbox" id="catchAllCheck" checked>
-                                <label class="form-check-label fw-semibold small" for="catchAllCheck">
-                                    Detect catch-all domains<br>
-                                    <span class="text-secondary" style="font-size:12px">(more accurate, uses extra probes)</span>
-                                </label>
-                            </div>
-                        </div>
+    <!-- Controls Card -->
+    <div class="card">
+        <div class="card-title"><span class="icon">⚙️</span> Configuration</div>
 
-                        <!-- Buttons -->
-                        <div class="col-md-5">
-                            <div class="d-flex gap-2">
-                                <button id="loadDefaultBtn" class="btn btn-outline-secondary px-3" type="button">📂 Load email_list.txt</button>
-                                <button id="startBtn" class="btn btn-success px-4 fw-bold flex-grow-1" style="border-radius: 8px;">▶ Start Validation</button>
-                            </div>
-                        </div>
-                    </div>
+        <div class="controls-grid">
+            <div class="control-group">
+                <label>Parallel Workers</label>
+                <input id="workersInput" type="number" min="1" max="50" value="20">
+            </div>
 
-                    <div class="mb-2">
-                        <textarea id="emailsInput" class="form-control" rows="7" placeholder="Paste emails here (one per line) or load email_list.txt&#10;Supports email:password lines too — only email part is used." style="border-radius: 8px; font-family: ui-monospace, monospace; font-size: 14px;"></textarea>
-                    </div>
+            <div class="control-group">
+                <label>Options</label>
+                <label class="toggle">
+                    <input type="checkbox" id="catchAllCheck" checked>
+                    <span class="toggle-track"></span>
+                    <span class="toggle-knob"></span>
+                </label>
+                <span class="toggle-label" style="margin-top:4px;display:block">Detect catch-all domains</span>
+            </div>
 
-                    <!-- Progress + Status -->
-                    <div class="d-flex justify-content-between align-items-center mb-2">
-                        <div>
-                            <span id="statusText" class="fw-semibold text-secondary">Ready — load list or paste emails</span>
-                        </div>
-                        <div id="progressText" class="fw-bold small text-primary" style="min-width: 90px; text-align: right;"></div>
-                    </div>
-
-                    <div class="progress mb-2" style="height: 22px; display: none; border-radius: 999px; overflow: hidden;" id="progressContainer">
-                        <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-primary" role="progressbar" style="width: 0%; font-weight: 600;">0%</div>
-                    </div>
-
-                    <!-- Live Stats -->
-                    <div id="statsRow" class="d-flex flex-wrap gap-2 mb-1" style="display: none;">
-                        <span class="badge bg-success stat-badge">🟢 Valid: <span id="cValid">0</span></span>
-                        <span class="badge bg-warning text-dark stat-badge">🟡 Catch-all: <span id="cCatch">0</span></span>
-                        <span class="badge bg-danger stat-badge">🔴 Invalid: <span id="cInvalid">0</span></span>
-                        <span class="badge bg-secondary stat-badge">⚪ Unknown: <span id="cUnknown">0</span></span>
-                        <span class="badge bg-info text-dark stat-badge">Total checked: <span id="cTotal">0</span> / <span id="cTotalTarget">0</span></span>
-                    </div>
-
-                    <!-- Download Links -->
-                    <div id="downloadsSection" class="mt-2 pt-2 border-top" style="display: none;">
-                        <div class="small fw-semibold text-secondary mb-1">📥 Download results (updates live):</div>
-                        <div class="d-flex flex-wrap gap-2">
-                            <a href="/download/actual_email.txt" download
-                               class="btn btn-sm btn-success d-flex align-items-center gap-1"
-                               style="font-size: 0.82rem; border-radius: 6px; padding-top:2px; padding-bottom:2px;">
-                                📥 <span>actual_email.txt</span>
-                                <small class="opacity-75 ms-1 d-none d-sm-inline">(valid + catch-all)</small>
-                            </a>
-                            <a href="/download/wrong_email.txt" download
-                               class="btn btn-sm btn-danger d-flex align-items-center gap-1"
-                               style="font-size: 0.82rem; border-radius: 6px; padding-top:2px; padding-bottom:2px;">
-                                📥 <span>wrong_email.txt</span>
-                            </a>
-                            <a href="/download/checked_email.txt" download
-                               class="btn btn-sm btn-outline-dark d-flex align-items-center gap-1"
-                               style="font-size: 0.82rem; border-radius: 6px; padding-top:2px; padding-bottom:2px;">
-                                📥 <span>checked_email.txt</span>
-                                <small class="opacity-75 ms-1 d-none d-sm-inline">(full details)</small>
-                            </a>
-                        </div>
-                    </div>
+            <div class="control-group">
+                <label>Actions</label>
+                <div class="btn-row">
+                    <button id="loadBtn" class="btn btn-load" type="button">📂 Load File</button>
+                    <button id="startBtn" class="btn btn-start" type="button">▶ Start Validation</button>
+                    <button id="cancelBtn" class="btn btn-cancel" type="button">⏹ Cancel</button>
                 </div>
+            </div>
+        </div>
 
-                <!-- Log -->
-                <div class="card p-3">
-                    <div class="d-flex justify-content-between align-items-center mb-2 px-1">
-                        <h6 class="text-dark fw-bold mb-0">📋 Live Verification Log</h6>
-                        <button id="clearLogBtn" class="btn btn-sm btn-outline-secondary py-0 px-2" style="font-size:12px">Clear log</button>
-                    </div>
-                    <div id="logConsole">Waiting for email list...</div>
+        <textarea id="emailsInput" class="email-textarea" rows="8"
+            placeholder="Paste emails here (one per line) or click Load File to import email_list.txt&#10;&#10;Supports formats: email@example.com, email:password, email,name"></textarea>
+        <div id="emailCount" class="email-count">No emails loaded</div>
+
+        <!-- Progress Section -->
+        <div id="progressSection" class="progress-section">
+            <div class="progress-header">
+                <span id="statusText" class="progress-status">Ready</span>
+                <span id="progressCounter" class="progress-counter"></span>
+            </div>
+            <div class="progress-track">
+                <div id="progressFill" class="progress-fill"></div>
+            </div>
+            <div id="speedRow" class="speed-row">
+                <span>⚡ <strong id="speedVal">0</strong> emails/sec</span>
+                <span>⏱ Elapsed: <strong id="elapsedVal">0s</strong></span>
+                <span>📍 ETA: <strong id="etaVal">—</strong></span>
+            </div>
+            <div class="stats-grid">
+                <div class="stat-card stat-valid">
+                    <div>🟢<br><span style="font-size:0.65rem">Valid</span></div>
+                    <div class="stat-count" id="cValid">0</div>
                 </div>
-
-                <!-- Downloads are now available as buttons above the log (in the main card) -->
+                <div class="stat-card stat-likely">
+                    <div>💚<br><span style="font-size:0.65rem">Likely</span></div>
+                    <div class="stat-count" id="cLikely">0</div>
+                </div>
+                <div class="stat-card stat-catch">
+                    <div>🟡<br><span style="font-size:0.65rem">Catch-All</span></div>
+                    <div class="stat-count" id="cCatch">0</div>
+                </div>
+                <div class="stat-card stat-invalid">
+                    <div>🔴<br><span style="font-size:0.65rem">Invalid</span></div>
+                    <div class="stat-count" id="cInvalid">0</div>
+                </div>
+                <div class="stat-card stat-undet">
+                    <div>🟠<br><span style="font-size:0.65rem">Undet.</span></div>
+                    <div class="stat-count" id="cUndet">0</div>
+                </div>
+                <div class="stat-card stat-unknown">
+                    <div>⚪<br><span style="font-size:0.65rem">Unknown</span></div>
+                    <div class="stat-count" id="cUnknown">0</div>
+                </div>
+                <div class="stat-card stat-total">
+                    <div>📊<br><span style="font-size:0.65rem">Total</span></div>
+                    <div class="stat-count"><span id="cTotal">0</span>/<span id="cTarget">0</span></div>
+                </div>
             </div>
         </div>
     </div>
 
-    <script>
-        // Sync range + number input for workers
-        const range = document.getElementById('workersRange');
-        const num = document.getElementById('workersInput');
-        function syncWorkers(val) {
-            range.value = val;
-            num.value = val;
+    <!-- Log Card -->
+    <div class="card">
+        <div class="log-header">
+            <div class="card-title" style="margin-bottom:0"><span class="icon">📋</span> Live Verification Log</div>
+            <button id="clearBtn" class="btn-clear">Clear</button>
+        </div>
+        <div class="log-console">
+            <div id="logConsole" class="log-inner">
+                <div class="log-system">Waiting for email list...</div>
+            </div>
+            <div id="logCapNotice" class="log-cap-notice" style="display:none">
+                Showing last <strong>500</strong> entries of <span id="logTotalCount">0</span> results
+            </div>
+        </div>
+    </div>
+
+    <!-- Downloads Card -->
+    <div id="downloadsSection" class="card downloads-section">
+        <div class="card-title"><span class="icon">📥</span> Download Results</div>
+        <div class="download-grid">
+            <a href="/download/actual_email.txt" download class="dl-btn">
+                <span class="dl-icon">✅</span>
+                <div>actual_email.txt<br><span class="dl-sub">valid + likely valid + catch-all</span></div>
+            </a>
+            <a href="/download/wrong_email.txt" download class="dl-btn">
+                <span class="dl-icon">❌</span>
+                <div>wrong_email.txt<br><span class="dl-sub">invalid emails</span></div>
+            </a>
+            <a href="/download/undetermined_email.txt" download class="dl-btn">
+                <span class="dl-icon">⚠️</span>
+                <div>undetermined_email.txt<br><span class="dl-sub">unclear result — retry later</span></div>
+            </a>
+            <a href="/download/checked_email.txt" download class="dl-btn">
+                <span class="dl-icon">📄</span>
+                <div>checked_email.txt<br><span class="dl-sub">full audit log</span></div>
+            </a>
+        </div>
+        <div class="note-text">
+            <strong>undetermined</strong> = server connected but dropped probe before giving a clear answer.
+            These are NOT confirmed invalid — verify manually or retry later.
+        </div>
+    </div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// State
+let currentSessionId = null;
+let eventSource = null;
+let startTime = null;
+let totalEmails = 0;
+let completedEmails = 0;
+let logEntries = [];
+const MAX_LOG_ENTRIES = 500;
+
+// Helpers
+function formatTime(seconds) {
+    if (seconds < 60) return Math.round(seconds) + 's';
+    if (seconds < 3600) return Math.floor(seconds/60) + 'm ' + Math.round(seconds%60) + 's';
+    return Math.floor(seconds/3600) + 'h ' + Math.floor((seconds%3600)/60) + 'm';
+}
+
+function countEmails(text) {
+    if (!text.trim()) return 0;
+    return text.trim().split('\\n').filter(l => {
+        l = l.trim();
+        return l && !l.startsWith('#') && l.includes('@');
+    }).length;
+}
+
+// Live email count in textarea
+$('emailsInput').addEventListener('input', function() {
+    const count = countEmails(this.value);
+    $('emailCount').innerHTML = count > 0
+        ? `<strong>${count.toLocaleString()}</strong> emails loaded`
+        : 'No emails loaded';
+});
+
+// Load email_list.txt
+$('loadBtn').addEventListener('click', async function() {
+    this.disabled = true;
+    this.textContent = '⏳ Loading...';
+    try {
+        const text = await fetch('/load_default').then(r => r.text());
+        if (text.trim()) {
+            $('emailsInput').value = text;
+            $('emailsInput').dispatchEvent(new Event('input'));
+        } else {
+            alert('email_list.txt is empty or not found.');
         }
-        range.addEventListener('input', () => syncWorkers(range.value));
-        num.addEventListener('input', () => syncWorkers(num.value));
+    } catch {
+        alert('Failed to load email_list.txt');
+    }
+    this.disabled = false;
+    this.textContent = '📂 Load File';
+});
 
-        // Load default list button
-        document.getElementById('loadDefaultBtn').addEventListener('click', async function() {
-            const btn = this;
-            btn.disabled = true;
-            btn.textContent = 'Loading...';
-            try {
-                const res = await fetch('/load_default');
-                const text = await res.text();
-                if (text && text.trim()) {
-                    document.getElementById('emailsInput').value = text;
-                } else {
-                    alert('email_list.txt is empty or not found.');
+// Clear log
+$('clearBtn').addEventListener('click', () => {
+    $('logConsole').innerHTML = '';
+    logEntries = [];
+    $('logCapNotice').style.display = 'none';
+});
+
+// Add log entry with virtual scrolling
+function addLogEntry(html) {
+    logEntries.push(html);
+    const log = $('logConsole');
+
+    // Virtual scrolling: keep only last MAX_LOG_ENTRIES in DOM
+    if (logEntries.length > MAX_LOG_ENTRIES) {
+        $('logCapNotice').style.display = 'block';
+        $('logTotalCount').textContent = logEntries.length.toLocaleString();
+
+        // Rebuild DOM with last 500
+        const visibleEntries = logEntries.slice(-MAX_LOG_ENTRIES);
+        log.innerHTML = visibleEntries.join('');
+    } else {
+        log.insertAdjacentHTML('beforeend', html);
+    }
+
+    log.scrollTop = log.scrollHeight;
+}
+
+// Cancel
+$('cancelBtn').addEventListener('click', function() {
+    if (!currentSessionId) return;
+
+    this.disabled = true;
+    this.classList.add('cancelling');
+    this.textContent = '⏳ Cancelling...';
+
+    fetch('/cancel', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({session_id: currentSessionId})
+    });
+});
+
+// Speed/ETA update loop
+let speedInterval = null;
+function startSpeedTracker() {
+    startTime = Date.now();
+    completedEmails = 0;
+    speedInterval = setInterval(() => {
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = elapsed > 0 ? completedEmails / elapsed : 0;
+        const remaining = totalEmails - completedEmails;
+        const eta = speed > 0 ? remaining / speed : 0;
+
+        $('elapsedVal').textContent = formatTime(elapsed);
+        $('speedVal').textContent = speed.toFixed(1);
+        $('etaVal').textContent = remaining > 0 ? '~' + formatTime(eta) : '—';
+    }, 500);
+}
+function stopSpeedTracker() {
+    if (speedInterval) {
+        clearInterval(speedInterval);
+        speedInterval = null;
+    }
+    // Final update
+    if (startTime) {
+        const elapsed = (Date.now() - startTime) / 1000;
+        $('elapsedVal').textContent = formatTime(elapsed);
+        const speed = elapsed > 0 ? completedEmails / elapsed : 0;
+        $('speedVal').textContent = speed.toFixed(1);
+        $('etaVal').textContent = 'Done';
+    }
+}
+
+function resetUI() {
+    $('startBtn').disabled = false;
+    $('startBtn').style.display = '';
+    $('cancelBtn').style.display = 'none';
+    $('cancelBtn').disabled = false;
+    $('cancelBtn').classList.remove('cancelling');
+    $('cancelBtn').textContent = '⏹ Cancel';
+    $('loadBtn').disabled = false;
+    stopSpeedTracker();
+}
+
+// Start validation
+$('startBtn').addEventListener('click', function() {
+    const inputText = $('emailsInput').value.trim();
+    const workers = parseInt($('workersInput').value) || 20;
+    const catchAll = $('catchAllCheck').checked ? 1 : 0;
+
+    if (!inputText) {
+        alert('Please paste emails or load email_list.txt first.');
+        return;
+    }
+
+    // Generate session ID
+    currentSessionId = crypto.randomUUID ? crypto.randomUUID() :
+        'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+            const r = Math.random() * 16 | 0;
+            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        });
+
+    // Reset counters
+    logEntries = [];
+    completedEmails = 0;
+    totalEmails = 0;
+    ['cValid','cLikely','cCatch','cInvalid','cUndet','cUnknown','cTotal','cTarget'].forEach(id => {
+        $(id).textContent = '0';
+    });
+
+    // UI state
+    this.disabled = true;
+    this.style.display = 'none';
+    $('cancelBtn').style.display = '';
+    $('cancelBtn').disabled = false;
+    $('cancelBtn').classList.remove('cancelling');
+    $('cancelBtn').textContent = '⏹ Cancel';
+    $('loadBtn').disabled = true;
+    $('progressSection').classList.add('active');
+    $('progressFill').style.width = '0%';
+    $('downloadsSection').classList.add('active');
+    $('logConsole').innerHTML = '<div class="log-system">🚀 Starting verification engine (workers: ' + workers + ')...</div>';
+    $('logCapNotice').style.display = 'none';
+    $('statusText').textContent = 'Starting...';
+    $('statusText').className = 'progress-status running pulse';
+
+    startSpeedTracker();
+
+    // POST the data to start validation
+    fetch('/sort_emails', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'workers=' + workers + '&catch_all=' + catchAll +
+              '&session_id=' + encodeURIComponent(currentSessionId) +
+              '&data=' + encodeURIComponent(inputText)
+    }).then(response => {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        function processChunk(chunk) {
+            buffer += chunk;
+            const lines = buffer.split('\\n');
+            buffer = lines.pop(); // keep incomplete line
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const d = JSON.parse(line.slice(6));
+                        handleEvent(d);
+                    } catch {}
                 }
-            } catch (e) {
-                alert('Failed to load email_list.txt');
             }
-            btn.disabled = false;
-            btn.textContent = '📂 Load email_list.txt';
-        });
+        }
 
-        // Clear log
-        document.getElementById('clearLogBtn').addEventListener('click', () => {
-            document.getElementById('logConsole').innerHTML = '';
-        });
-
-        // Main Start
-        document.getElementById('startBtn').addEventListener('click', function() {
-            let inputText = document.getElementById('emailsInput').value.trim();
-
-            // If empty, try to auto-load default on the fly
-            if (!inputText) {
-                // We will let backend load email_list.txt automatically
-            }
-
-            const workers = parseInt(document.getElementById('workersInput').value) || 5;
-            const catchAll = document.getElementById('catchAllCheck').checked ? 1 : 0;
-
-            // UI setup
-            document.getElementById('startBtn').disabled = true;
-            document.getElementById('loadDefaultBtn').disabled = true;
-            document.getElementById('logConsole').innerHTML = '<div style="color:#3498db">🚀 Starting parallel verification engine (workers: ' + workers + ')...</div>';
-            document.getElementById('progressContainer').style.display = 'flex';
-            document.getElementById('downloadsSection').style.display = 'block';
-            const progressBar = document.getElementById('progressBar');
-            progressBar.style.width = '0%';
-            progressBar.innerText = '0%';
-            document.getElementById('progressText').innerText = '';
-
-            // Reset stats
-            ['cValid','cCatch','cInvalid','cUnknown','cTotal'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.textContent = '0';
+        function pump() {
+            reader.read().then(({done, value}) => {
+                if (done) {
+                    // Process remaining buffer
+                    if (buffer.startsWith('data: ')) {
+                        try {
+                            const d = JSON.parse(buffer.slice(6));
+                            handleEvent(d);
+                        } catch {}
+                    }
+                    resetUI();
+                    return;
+                }
+                processChunk(decoder.decode(value, {stream: true}));
+                pump();
+            }).catch(() => {
+                resetUI();
+                $('statusText').textContent = 'Connection lost';
+                $('statusText').className = 'progress-status cancelled';
+                addLogEntry('<div class="log-invalid">[Connection closed]</div>');
             });
-            document.getElementById('cTotalTarget').textContent = '0';
-            document.getElementById('statsRow').style.display = 'flex';
+        }
+        pump();
+    }).catch(() => {
+        resetUI();
+        $('statusText').textContent = 'Connection failed';
+        $('statusText').className = 'progress-status cancelled';
+        addLogEntry('<div class="log-invalid">[Connection failed]</div>');
+    });
+});
 
-            const statusEl = document.getElementById('statusText');
-            statusEl.innerText = 'Running...';
+function handleEvent(d) {
+    if (d.type === 'progress') {
+        totalEmails = d.total || totalEmails;
+        completedEmails = d.current;
 
-            // Build SSE URL
-            let url = '/sort_emails?workers=' + workers + '&catch_all=' + catchAll;
-            if (inputText) {
-                url += '&data=' + encodeURIComponent(inputText);
+        const pct = d.percentage;
+        $('progressFill').style.width = pct + '%';
+        $('progressCounter').textContent = d.current.toLocaleString() + ' / ' + d.total.toLocaleString();
+        $('statusText').textContent = 'Validating: ' + d.current.toLocaleString() + ' / ' + d.total.toLocaleString();
+        $('cTarget').textContent = d.total.toLocaleString();
+
+        const STATUS_MAP = {
+            valid:        { cls: 'log-valid',   icon: '🟢 [VALID]',         counter: 'cValid'   },
+            likely_valid: { cls: 'log-likely',  icon: '💚 [LIKELY VALID]',  counter: 'cLikely'  },
+            catch_all:    { cls: 'log-catch',   icon: '🟡 [CATCH-ALL]',     counter: 'cCatch'   },
+            invalid:      { cls: 'log-invalid', icon: '🔴 [INVALID]',       counter: 'cInvalid' },
+            undetermined: { cls: 'log-undet',   icon: '🟠 [UNDETERMINED]',  counter: 'cUndet'   },
+        };
+        const s = STATUS_MAP[d.status] || { cls: 'log-unknown', icon: '⚪ [UNKNOWN]', counter: 'cUnknown' };
+
+        $(s.counter).textContent = (parseInt($(s.counter).textContent.replace(/,/g,'')) + 1).toLocaleString();
+        $('cTotal').textContent = (parseInt($('cTotal').textContent.replace(/,/g,'')) + 1).toLocaleString();
+
+        addLogEntry('<div class="log-entry ' + s.cls + '">' + s.icon + ' ' + d.email + ' — ' + d.details + '</div>');
+    }
+    else if (d.type === 'dns_prewarm') {
+        addLogEntry('<div class="log-system">🔍 Pre-warming DNS cache for ' + d.domains + ' unique domains...</div>');
+    }
+    else if (d.type === 'dns_done') {
+        addLogEntry('<div class="log-system">✅ DNS cache warmed in ' + d.elapsed + 's — starting SMTP probes</div>');
+    }
+    else if (d.type === 'retry_start') {
+        addLogEntry('<div class="log-system">🔄 Auto-retrying ' + d.count + ' undetermined emails...</div>');
+    }
+    else if (d.type === 'complete' || d.type === 'cancelled') {
+        const sm = d.summary || {};
+        const isDone = d.type === 'complete';
+
+        $('statusText').textContent = isDone ? '✅ Finished!' : '⏹ Cancelled';
+        $('statusText').className = 'progress-status ' + (isDone ? 'finished' : 'cancelled');
+
+        const label = isDone ? '🏆 DONE' : '⏹ CANCELLED';
+        addLogEntry(
+            '<div class="log-done">' + label + ' — Valid: ' + (sm.valid||0) +
+            ' | Likely Valid: ' + (sm.likely_valid||0) +
+            ' | Catch-All: ' + (sm.catch_all||0) +
+            ' | Invalid: ' + (sm.invalid||0) +
+            ' | Undetermined: ' + (sm.undetermined||0) +
+            ' | Unknown: ' + (sm.unknown||0) +
+            ' | Total: ' + (sm.total||0) + '</div>'
+        );
+        if (isDone) {
+            addLogEntry('<div class="log-system" style="font-size:0.7rem;margin-top:4px">✅ Download files are ready.</div>');
+        } else {
+            addLogEntry('<div class="log-system" style="font-size:0.7rem;margin-top:4px">Partial results saved to files. You can download what was completed.</div>');
+        }
+
+        resetUI();
+    }
+}
+
+// Auto-load email_list.txt on page open
+window.addEventListener('DOMContentLoaded', () => {
+    const ta = $('emailsInput');
+    if (!ta.value.trim()) {
+        fetch('/load_default').then(r => r.text()).then(t => {
+            if (t.trim() && !ta.value.trim()) {
+                ta.value = t;
+                ta.dispatchEvent(new Event('input'));
             }
-            const eventSource = new EventSource(url);
-
-            let totalEmails = 0;
-
-            eventSource.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-
-                if (data.type === 'progress') {
-                    totalEmails = data.total || totalEmails;
-                    progressBar.style.width = data.percentage + '%';
-                    progressBar.innerText = data.percentage + '%';
-                    document.getElementById('progressText').innerText = `${data.current}/${data.total}`;
-                    statusEl.innerText = `Progress: ${data.current} / ${data.total}  (workers: ${workers})`;
-
-                    // Update counters
-                    const cValid = document.getElementById('cValid');
-                    const cCatch = document.getElementById('cCatch');
-                    const cInvalid = document.getElementById('cInvalid');
-                    const cUnknown = document.getElementById('cUnknown');
-                    const cTotal = document.getElementById('cTotal');
-                    const cTarget = document.getElementById('cTotalTarget');
-
-                    cTarget.textContent = data.total;
-
-                    let cls = 'log-invalid', icon = '🔴 [INVALID]';
-                    if (data.status === 'valid') {
-                        cls = 'log-valid';
-                        icon = '🟢 [VALID]';
-                        cValid.textContent = parseInt(cValid.textContent) + 1;
-                    } else if (data.status === 'catch_all') {
-                        cls = 'log-catch';
-                        icon = '🟡 [CATCH-ALL]';
-                        cCatch.textContent = parseInt(cCatch.textContent) + 1;
-                    } else if (data.status === 'invalid') {
-                        cInvalid.textContent = parseInt(cInvalid.textContent) + 1;
-                    } else {
-                        cls = 'log-unknown';
-                        icon = '⚪ [UNKNOWN]';
-                        cUnknown.textContent = parseInt(cUnknown.textContent) + 1;
-                    }
-                    cTotal.textContent = parseInt(cTotal.textContent) + 1;
-
-                    const line = `<div class="${cls}" style="margin-bottom:2px;">${icon} ${data.email} — ${data.details}</div>`;
-                    const log = document.getElementById('logConsole');
-                    log.innerHTML += line;
-                    log.scrollTop = log.scrollHeight;
-                } 
-                else if (data.type === 'complete') {
-                    eventSource.close();
-                    document.getElementById('startBtn').disabled = false;
-                    document.getElementById('loadDefaultBtn').disabled = false;
-                    statusEl.innerText = 'Finished!';
-
-                    const s = data.summary || {valid:0, catch_all:0, invalid:0, unknown:0, total: totalEmails};
-                    const summaryLine = `<div class="mt-2" style="color:#f1c40f; font-weight:600;">🏆 FINISHED — Valid: ${s.valid} | Catch-all: ${s.catch_all} | Invalid: ${s.invalid} | Unknown: ${s.unknown} | Total: ${s.total}</div>`;
-                    document.getElementById('logConsole').innerHTML += summaryLine + 
-                        `<div style="color:#16a34a; font-size:12.5px; font-weight:500;">✅ Use the 📥 Download buttons above the log (in the main panel) — files are ready.</div>`;
-                    document.getElementById('logConsole').scrollTop = document.getElementById('logConsole').scrollHeight;
-                }
-            };
-
-            eventSource.onerror = function() {
-                eventSource.close();
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('loadDefaultBtn').disabled = false;
-                statusEl.innerText = 'Stopped / Error';
-                document.getElementById('logConsole').innerHTML += `<div style="color:#e74c3c;">[Connection closed]</div>`;
-            };
-        });
-
-        // Auto-load default list into textarea on first visit (nice UX)
-        window.addEventListener('DOMContentLoaded', () => {
-            const ta = document.getElementById('emailsInput');
-            if (!ta.value.trim()) {
-                // load silently in background
-                fetch('/load_default').then(r => r.text()).then(t => {
-                    if (t && t.trim() && !ta.value.trim()) {
-                        ta.value = t;
-                    }
-                }).catch(()=>{});
-            }
-        });
-    </script>
+        }).catch(() => {});
+    }
+});
+</script>
 </body>
-</html>
-"""
+</html>"""
 
-@app.route('/')
+
+# =============================================================
+# Flask routes
+# =============================================================
+@app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML)
 
 
-@app.route('/load_default')
+@app.route("/load_default")
 def load_default():
-    """Return contents of email_list.txt so UI can load it with one click."""
+    """Return the contents of email_list.txt for the UI to pre-load."""
     try:
         with open("email_list.txt", "r", encoding="utf-8") as f:
             return Response(f.read(), mimetype="text/plain")
@@ -528,149 +1314,262 @@ def load_default():
         return Response("", mimetype="text/plain")
 
 
-@app.route('/download/<filename>')
+@app.route("/download/<filename>")
 def download_file(filename):
-    """Serve the result files for easy download."""
-    allowed = {"actual_email.txt", "wrong_email.txt", "checked_email.txt"}
+    """Serve one of the result files as a download."""
+    allowed = {"actual_email.txt", "wrong_email.txt", "checked_email.txt", "undetermined_email.txt"}
     if filename not in allowed:
         return "File not allowed", 400
     try:
-        return send_from_directory(
-            directory=".",
-            path=filename,
-            as_attachment=True
-        )
+        return send_from_directory(directory=".", path=filename, as_attachment=True)
     except FileNotFoundError:
-        return "File not found. Please run a validation first.", 404
+        return "File not found — run a validation first.", 404
 
 
-@app.route('/sort_emails')
+@app.route("/cancel", methods=["POST"])
+def cancel_validation():
+    """Cancel a running validation session."""
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id", "")
+    if not session_id:
+        return jsonify({"error": "No session_id provided"}), 400
+
+    with _cancel_lock:
+        evt = _cancel_events.get(session_id)
+        if evt:
+            evt.set()
+            return jsonify({"status": "cancelling", "session_id": session_id})
+
+    return jsonify({"status": "not_found", "session_id": session_id}), 404
+
+
+@app.route("/sort_emails", methods=["GET", "POST"])
 def sort_emails():
-    raw_data = request.args.get('data', '').strip()
+    """SSE endpoint: stream per-email results as they complete."""
+    if request.method == "POST":
+        raw_data = request.form.get("data", "").strip()
+        workers = max(1, min(50, int(request.form.get("workers", "20") or "20")))
+        detect_catch = request.form.get("catch_all", "1") == "1"
+        session_id = request.form.get("session_id", str(uuid.uuid4()))
+    else:
+        raw_data = request.args.get("data", "").strip()
+        workers = max(1, min(50, int(request.args.get("workers", "20") or "20")))
+        detect_catch = request.args.get("catch_all", "1") == "1"
+        session_id = request.args.get("session_id", str(uuid.uuid4()))
 
-    # Workers (3-10)
-    try:
-        workers = max(3, min(10, int(request.args.get('workers', '5'))))
-    except Exception:
-        workers = 5
-
-    detect_catch = request.args.get('catch_all', '1') == '1'
-
-    # If no data passed from UI, auto-load the default file (as requested)
+    # Fall back to email_list.txt if no data was passed
     if not raw_data:
         try:
             with open("email_list.txt", "r", encoding="utf-8") as f:
                 raw_data = f.read()
         except FileNotFoundError:
-            raw_data = ''
+            raw_data = ""
 
-    # Parse + clean + deduplicate (preserve original case)
-    emails = []
+    # Parse and deduplicate email list
+    # Supports plain addresses, "email:password" and "email,other" formats
+    seen, emails = set(), []
     for line in raw_data.splitlines():
         line = line.strip()
-        if not line or line.startswith('#'):
+        if not line or line.startswith("#"):
             continue
-        # Support "email:password" or "email,password" formats
-        email = line.split(':', 1)[0].strip()
-        if '@' not in email:
-            email = line.split(',', 1)[0].strip()
-        if email:
-            emails.append(email)
-
-    # Dedup by lower-cased key while preserving first-seen casing
-    seen = set()
-    lines = []
-    for e in emails:
-        key = e.lower()
-        if key not in seen:
+        addr = line.split(":", 1)[0].strip()
+        if "@" not in addr:
+            addr = line.split(",", 1)[0].strip()
+        key = addr.lower()
+        if addr and key not in seen:
             seen.add(key)
-            lines.append(e)
+            emails.append(addr)
 
-    total_emails = len(lines)
+    total = len(emails)
 
-    # Clear output files at start of run
-    for fname in ("actual_email.txt", "wrong_email.txt", "checked_email.txt"):
+    # Register cancel event for this session
+    cancel_event = threading.Event()
+    with _cancel_lock:
+        _cancel_events[session_id] = cancel_event
+
+    # Clear output files before the run
+    for fname in ("actual_email.txt", "wrong_email.txt", "checked_email.txt", "undetermined_email.txt"):
         open(fname, "w", encoding="utf-8").close()
 
     def generate():
-        counts = {'valid': 0, 'catch_all': 0, 'invalid': 0, 'unknown': 0}
-        completed = 0
+        counts = {k: 0 for k in ("valid", "likely_valid", "catch_all", "invalid", "undetermined", "unknown")}
 
-        def classify_for_ui(status, details):
-            if status == "valid":
-                return "valid", details or "Mailbox accepts mail"
-            elif status == "catch_all":
-                return "catch_all", details or "Catch-all domain"
-            elif status in ("invalid_syntax", "no_mx", "mailbox_invalid", "smtp_error", "temp_error"):
-                return "invalid", details or status.replace("_", " ").title()
-            else:
-                return "unknown", details or status.replace("_", " ").title()
+        def ui_status(raw: str, detail: str) -> tuple[str, str]:
+            """Map internal status codes to UI display statuses."""
+            if raw == "valid":
+                return "valid", detail
+            if raw == "likely_valid":
+                return "likely_valid", detail
+            if raw == "catch_all":
+                return "catch_all", detail
+            if raw == "invalid":
+                return "invalid", detail
+            if raw == "undetermined":
+                return "undetermined", detail
+            return "unknown", detail
 
-        def write_files(email, status, details):
-            with file_lock:
-                if status in ("valid", "catch_all"):
-                    with open("actual_email.txt", "a", encoding="utf-8") as f:
-                        f.write(f"{email}\n")
+        def write_result(email: str, raw: str, detail: str):
+            with _file_lock:
+                if raw in ("valid", "likely_valid", "catch_all"):
+                    fname = "actual_email.txt"
+                elif raw == "invalid":
+                    fname = "wrong_email.txt"
+                elif raw == "undetermined":
+                    fname = "undetermined_email.txt"
                 else:
-                    with open("wrong_email.txt", "a", encoding="utf-8") as f:
-                        f.write(f"{email}\n")
-                with open("checked_email.txt", "a", encoding="utf-8") as f:
-                    f.write(f"{email} => {status}: {details}\n")
+                    fname = None
 
-        if total_emails == 0:
-            yield f"data: {json.dumps({'type': 'complete', 'summary': {'total': 0, 'valid': 0, 'catch_all': 0, 'invalid': 0, 'unknown': 0}})}\n\n"
+                if fname:
+                    with open(fname, "a", encoding="utf-8") as f:
+                        f.write(email + "\n")
+
+                # Full audit log always
+                with open("checked_email.txt", "a", encoding="utf-8") as f:
+                    f.write(f"{email} => {raw}: {detail}\n")
+
+        if total == 0:
+            yield f"data: {json.dumps({'type': 'complete', 'summary': {k: 0 for k in counts}})}\n\n"
+            return
+
+        # Pre-warm DNS cache
+        all_domains = list({e.rsplit("@", 1)[-1].lower() for e in emails if "@" in e})
+        yield f"data: {json.dumps({'type': 'dns_prewarm', 'domains': len(all_domains)})}\n\n"
+
+        dns_start = time.time()
+        prewarm_mx_cache(all_domains, max_workers=min(30, len(all_domains)))
+        dns_elapsed = round(time.time() - dns_start, 1)
+        yield f"data: {json.dumps({'type': 'dns_done', 'elapsed': dns_elapsed})}\n\n"
+
+        if cancel_event.is_set():
+            yield f"data: {json.dumps({'type': 'cancelled', 'summary': {**counts, 'total': 0}})}\n\n"
             return
 
         def task(email):
-            status, details = verify_email_delivery(email, detect_catch_all=detect_catch)
-            return email, status, details
+            return email, *verify_email(email, detect_catch_all=detect_catch)
 
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="val") as executor:
-            future_to_email = {executor.submit(task, email): email for email in lines}
+        completed = 0
+        undetermined_emails = []
 
-            for future in as_completed(future_to_email):
-                email, status, details = future.result()
-                display_status, ui_details = classify_for_ui(status, details)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ev") as pool:
+            futures = {}
+            # Submit all emails
+            for e in emails:
+                if cancel_event.is_set():
+                    break
+                futures[pool.submit(task, e)] = e
 
-                # Update counters
-                if display_status == "valid":
-                    counts['valid'] += 1
-                elif display_status == "catch_all":
-                    counts['catch_all'] += 1
-                elif display_status == "invalid":
-                    counts['invalid'] += 1
-                else:
-                    counts['unknown'] += 1
+            for future in as_completed(futures):
+                if cancel_event.is_set():
+                    # Cancel remaining futures
+                    for f in futures:
+                        f.cancel()
+                    break
 
+                try:
+                    email, raw, detail = future.result()
+                except Exception as exc:
+                    email = futures[future]
+                    raw, detail = "unknown", f"Worker exception: {str(exc)[:60]}"
+
+                display, ui_detail = ui_status(raw, detail)
+                counts[display] = counts.get(display, 0) + 1
                 completed += 1
-                percentage = int((completed / total_emails) * 100)
+                write_result(email, raw, detail)
 
-                write_files(email, status, details)
+                # Track undetermined for retry
+                if raw == "undetermined":
+                    undetermined_emails.append(email)
 
                 payload = {
-                    'type': 'progress',
-                    'current': completed,
-                    'total': total_emails,
-                    'percentage': percentage,
-                    'email': email,
-                    'status': display_status,
-                    'details': ui_details
+                    "type": "progress",
+                    "current": completed,
+                    "total": total,
+                    "percentage": int(completed / total * 100),
+                    "email": email,
+                    "status": display,
+                    "details": ui_detail,
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
 
-        summary = {
-            'total': total_emails,
-            'valid': counts['valid'],
-            'catch_all': counts['catch_all'],
-            'invalid': counts['invalid'],
-            'unknown': counts['unknown']
-        }
-        yield f"data: {json.dumps({'type': 'complete', 'summary': summary})}\n\n"
+        # Check if cancelled
+        if cancel_event.is_set():
+            yield f"data: {json.dumps({'type': 'cancelled', 'summary': {**counts, 'total': completed}})}\n\n"
+        else:
+            # Auto-retry undetermined emails (one pass)
+            if undetermined_emails and not cancel_event.is_set():
+                yield f"data: {json.dumps({'type': 'retry_start', 'count': len(undetermined_emails)})}\n\n"
 
-    return Response(generate(), mimetype='text/event-stream')
+                # Remove undetermined emails from output file before retry
+                with _file_lock:
+                    try:
+                        with open("undetermined_email.txt", "r", encoding="utf-8") as f:
+                            existing = set(f.read().strip().splitlines())
+                        retry_set = set(undetermined_emails)
+                        remaining_undet = existing - retry_set
+                        with open("undetermined_email.txt", "w", encoding="utf-8") as f:
+                            for e in remaining_undet:
+                                f.write(e + "\n")
+                    except Exception:
+                        pass
+
+                # Retry with different strategy (reverse port order)
+                def retry_task(email):
+                    return email, *verify_email(email, detect_catch_all=detect_catch)
+
+                retry_completed = 0
+                with ThreadPoolExecutor(max_workers=min(workers, len(undetermined_emails)), thread_name_prefix="retry") as pool:
+                    retry_futures = {pool.submit(retry_task, e): e for e in undetermined_emails}
+                    for future in as_completed(retry_futures):
+                        if cancel_event.is_set():
+                            for f in retry_futures:
+                                f.cancel()
+                            break
+
+                        try:
+                            email, raw, detail = future.result()
+                        except Exception as exc:
+                            email = retry_futures[future]
+                            raw, detail = "unknown", f"Retry exception: {str(exc)[:60]}"
+
+                        # Only update if result changed from undetermined
+                        if raw != "undetermined":
+                            # Adjust counts
+                            counts["undetermined"] = max(0, counts["undetermined"] - 1)
+                            display, ui_detail = ui_status(raw, detail)
+                            counts[display] = counts.get(display, 0) + 1
+                            write_result(email, raw, f"[RETRY] {detail}")
+
+                            retry_completed += 1
+                            payload = {
+                                "type": "progress",
+                                "current": completed + retry_completed,
+                                "total": total,
+                                "percentage": int(completed / total * 100),
+                                "email": email,
+                                "status": display,
+                                "details": f"[RETRY] {ui_detail}",
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n"
+                        else:
+                            # Still undetermined, re-write to file
+                            with _file_lock:
+                                with open("undetermined_email.txt", "a", encoding="utf-8") as f:
+                                    f.write(email + "\n")
+                                with open("checked_email.txt", "a", encoding="utf-8") as f:
+                                    f.write(f"{email} => {raw}: [RETRY] {detail}\n")
+
+            yield f"data: {json.dumps({'type': 'complete', 'summary': {**counts, 'total': total}})}\n\n"
+
+        # Cleanup cancel event
+        with _cancel_lock:
+            _cancel_events.pop(session_id, None)
+
+    return Response(generate(), mimetype="text/event-stream")
 
 
-if __name__ == '__main__':
-    print("🌍 Best Real Email Validator running on http://127.0.0.1:5051")
-    print("   Default list: email_list.txt | Workers: configurable 3-10 in UI")
+# =============================================================
+# Entry point
+# =============================================================
+if __name__ == "__main__":
+    print("Email Validator running at http://127.0.0.1:5051")
     app.run(debug=True, port=5051)
