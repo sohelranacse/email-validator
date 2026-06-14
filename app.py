@@ -111,52 +111,78 @@ class DomainRateLimiter:
             self._last[domain] = time.time()
 
 
-_rate_limiter = DomainRateLimiter()
+# Default DNS / rate-limit tunables — overridden per session via UI form fields
+DEFAULT_DNS_TIMEOUT = 3
+DEFAULT_DNS_LIFETIME = 5
+DEFAULT_RATE_INTERVAL = 0.15
 
-# Custom DNS resolver with shorter timeout
-_dns_resolver = dns.resolver.Resolver()
-_dns_resolver.timeout = 3
-_dns_resolver.lifetime = 5
+
+def _make_dns_resolver(timeout: float = DEFAULT_DNS_TIMEOUT, lifetime: float = DEFAULT_DNS_LIFETIME):
+    """Build a DNS resolver with the requested timeouts."""
+    r = dns.resolver.Resolver()
+    r.timeout = timeout
+    r.lifetime = lifetime
+    return r
+
+
+def _make_rate_limiter(min_interval: float = DEFAULT_RATE_INTERVAL) -> DomainRateLimiter:
+    """Build a per-domain rate limiter with the requested interval."""
+    return DomainRateLimiter(min_interval=min_interval)
 
 
 # =============================================================
 # DNS helpers
 # =============================================================
-def get_mx_server(domain: str) -> str | None:
-    """Return the best MX hostname for domain (with A-record fallback). Cached."""
+def get_mx_server(domain: str, use_a_fallback: bool = True,
+                  dns_timeout: float = DEFAULT_DNS_TIMEOUT,
+                  dns_lifetime: float = DEFAULT_DNS_LIFETIME) -> str | None:
+    """Return the best MX hostname for domain (with optional A-record fallback). Cached."""
+    cache_key = (domain, use_a_fallback, dns_timeout, dns_lifetime)
     with _mx_lock:
-        if domain in _mx_cache:
-            return _mx_cache[domain]
+        if cache_key in _mx_cache:
+            return _mx_cache[cache_key]
 
+    resolver = _make_dns_resolver(dns_timeout, dns_lifetime)
     result = None
     try:
-        records = _dns_resolver.resolve(domain, "MX")
+        records = resolver.resolve(domain, "MX")
         result = sorted(records, key=lambda r: r.preference)[0].exchange.to_text().rstrip(".")
     except Exception:
-        try:
-            _dns_resolver.resolve(domain, "A")
-            result = domain  # domain acts as its own mail server
-        except Exception:
+        if use_a_fallback:
+            try:
+                resolver.resolve(domain, "A")
+                result = domain  # domain acts as its own mail server
+            except Exception:
+                result = None
+        else:
             result = None
 
     with _mx_lock:
-        _mx_cache[domain] = result
+        _mx_cache[cache_key] = result
     return result
 
 
-def prewarm_mx_cache(domains: list[str], max_workers: int = 30):
+def prewarm_mx_cache(domains: list[str], max_workers: int = 30,
+                     use_a_fallback: bool = True,
+                     dns_timeout: float = DEFAULT_DNS_TIMEOUT,
+                     dns_lifetime: float = DEFAULT_DNS_LIFETIME):
     """Batch-resolve MX records for all unique domains before SMTP probes."""
     unresolved = []
     with _mx_lock:
         for d in domains:
-            if d not in _mx_cache:
+            cache_key = (d, use_a_fallback, dns_timeout, dns_lifetime)
+            if cache_key not in _mx_cache:
                 unresolved.append(d)
 
     if not unresolved:
         return
 
+    def _resolve(d):
+        get_mx_server(d, use_a_fallback=use_a_fallback,
+                      dns_timeout=dns_timeout, dns_lifetime=dns_lifetime)
+
     with ThreadPoolExecutor(max_workers=min(max_workers, len(unresolved))) as pool:
-        pool.map(get_mx_server, unresolved)
+        pool.map(_resolve, unresolved)
 
 
 # =============================================================
@@ -188,38 +214,61 @@ def _smtp_probe(host: str, port: int, mail_from: str, rcpt_to: str, timeout: int
     return code, text, banner
 
 
+def _parse_ports(ports_str: str) -> list[int]:
+    """Parse '25,587' style string into a unique, ordered list of ints."""
+    out: list[int] = []
+    seen: set = set()
+    for part in str(ports_str or "").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            n = int(p)
+        except ValueError:
+            continue
+        if n in (25, 465, 587, 2525) and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out or [25]
+
+
 # =============================================================
 # Catch-all detection
 # =============================================================
-def is_catch_all(host: str, domain: str) -> bool:
+def is_catch_all(host: str, domain: str, ports: list[int] | None = None,
+                 timeout: int = 6, rate_limiter: DomainRateLimiter | None = None) -> bool:
     """
     Probe with a random bogus address.
     If the server accepts it (250), the domain is catch-all.
     Result is cached per domain.
     """
+    cache_key = (domain, tuple(ports or (25, 587)), timeout)
     with _catch_lock:
-        if domain in _catch_cache:
-            return _catch_cache[domain]
+        if cache_key in _catch_cache:
+            return _catch_cache[cache_key]
 
     bogus = f"no-such-user-{random.randint(10_000_000, 99_999_999)}@{domain}"
     result = False
-    for port in (25, 587):
+    for port in (ports or [25, 587]):
         try:
-            code, _, _ = _smtp_probe(host, port, f"postmaster@{domain}", bogus, timeout=6)
+            if rate_limiter is not None:
+                rate_limiter.wait(domain)
+            code, _, _ = _smtp_probe(host, port, f"postmaster@{domain}", bogus, timeout=timeout)
             result = (code == 250)
             break
         except Exception:
             continue
 
     with _catch_lock:
-        _catch_cache[domain] = result
+        _catch_cache[cache_key] = result
     return result
 
 
 # =============================================================
 # Main verification logic
 # =============================================================
-def verify_email(email: str, detect_catch_all: bool = True) -> tuple[str, str]:
+def verify_email(email: str, detect_catch_all: bool = True,
+                 cfg: dict | None = None) -> tuple[str, str]:
     """
     Verify a single email address.
 
@@ -230,44 +279,73 @@ def verify_email(email: str, detect_catch_all: bool = True) -> tuple[str, str]:
       invalid       — Bad syntax, no MX, or SMTP 5xx rejection
       undetermined  — Server connected but dropped probe without clear answer
       unknown       — Unexpected error
+
+    `cfg` may contain:
+      timeout              — SMTP probe timeout in seconds (default 10)
+      min_interval         — per-domain rate-limit interval (default 0.15s)
+      ports                — list of SMTP ports to try in order (default [25, 587])
+      use_a_fallback       — fall back to A-record if no MX (default True)
+      skip_syntax          — skip email-validator syntax check (default False)
+      known_blocker_fallback — treat blocked providers as likely_valid (default True)
+      dns_timeout          — dnspython resolver.timeout (default 3)
+      dns_lifetime         — dnspython resolver.lifetime (default 5)
     """
+    cfg = cfg or {}
+    timeout = int(cfg.get("timeout", 10))
+    min_interval = float(cfg.get("min_interval", DEFAULT_RATE_INTERVAL))
+    ports = cfg.get("ports") or [25, 587]
+    use_a_fallback = bool(cfg.get("use_a_fallback", True))
+    skip_syntax = bool(cfg.get("skip_syntax", False))
+    known_blocker_enabled = bool(cfg.get("known_blocker_fallback", True))
+    dns_timeout = float(cfg.get("dns_timeout", DEFAULT_DNS_TIMEOUT))
+    dns_lifetime = float(cfg.get("dns_lifetime", DEFAULT_DNS_LIFETIME))
+
+    rate_limiter = _make_rate_limiter(min_interval)
+
     # 1. Syntax check
-    try:
-        validate_email(email, check_deliverability=False)
-    except EmailNotValidError:
-        return "invalid", "Bad email syntax"
+    if not skip_syntax:
+        try:
+            validate_email(email, check_deliverability=False)
+        except EmailNotValidError:
+            return "invalid", "Bad email syntax"
 
     domain = email.rsplit("@", 1)[-1].lower()
     if not domain:
         return "invalid", "Missing domain part"
 
     # 2. MX / A record lookup
-    mx = get_mx_server(domain)
+    mx = get_mx_server(domain, use_a_fallback=use_a_fallback,
+                       dns_timeout=dns_timeout, dns_lifetime=dns_lifetime)
     if not mx:
         return "invalid", "No mail server found (no MX or A record)"
 
-    known_blocker = domain in PROBE_BLOCKING_PROVIDERS
+    known_blocker = known_blocker_enabled and (domain in PROBE_BLOCKING_PROVIDERS)
 
-    # 3. SMTP probe — port 25 (two sender variants), then port 587
-    _rate_limiter.wait(domain)
+    # 3. SMTP probe — try each port with a postmaster sender first,
+    #    then a second probe on the first port with an empty sender.
+    rate_limiter.wait(domain)
 
-    probe_plan = [
-        (25,  f"postmaster@{domain}"),
-        (25,  ""),
-        (587, f"postmaster@{domain}"),
-    ]
+    # Build probe plan: for each user-selected port, try (port, postmaster@) then (port, "")
+    probe_plan: list[tuple[int, str]] = []
+    for p in ports:
+        probe_plan.append((p, f"postmaster@{domain}"))
+    if 25 in ports:
+        # preserve legacy behaviour: try empty sender on 25 once
+        probe_plan.append((25, ""))
     last_error = ("unknown", "Could not complete verification")
     banner = ""
 
     for attempt, (port, mail_from) in enumerate(probe_plan):
         if attempt > 0:
-            _rate_limiter.wait(domain)
+            rate_limiter.wait(domain)
 
         try:
-            code, msg_text, banner = _smtp_probe(mx, port, mail_from, email, timeout=10)
+            code, msg_text, banner = _smtp_probe(mx, port, mail_from, email, timeout=timeout)
 
             if code == 250:
-                if detect_catch_all and is_catch_all(mx, domain):
+                if detect_catch_all and is_catch_all(mx, domain, ports=ports,
+                                                     timeout=max(4, timeout - 2),
+                                                     rate_limiter=rate_limiter):
                     return "catch_all", "Catch-all domain — accepts mail to any address"
                 return "valid", f"Mailbox confirmed (SMTP 250, port {port})"
             elif code in (550, 551, 553, 554):
@@ -588,6 +666,93 @@ HTML = """<!DOCTYPE html>
             transform: translateY(-1px);
         }
 
+        /* Engine Configuration Panel */
+        .engine-config {
+            margin-top: 18px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background: var(--bg-input);
+            overflow: hidden;
+        }
+        .engine-config > summary {
+            cursor: pointer;
+            padding: 12px 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+            user-select: none;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .engine-config > summary::-webkit-details-marker { display: none; }
+        .engine-config > summary::before {
+            content: '▸';
+            display: inline-block;
+            transition: transform 0.15s;
+            color: var(--text-secondary);
+        }
+        .engine-config[open] > summary::before { transform: rotate(90deg); }
+        .engine-config > summary:hover { color: var(--accent); }
+        .engine-config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 14px;
+            padding: 8px 16px 16px;
+            border-top: 1px solid var(--border);
+        }
+        .ec-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .ec-group label {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .ec-hint {
+            font-size: 0.7rem;
+            font-weight: 400;
+            color: var(--text-muted);
+            text-transform: none;
+            letter-spacing: 0;
+        }
+        .ec-group input[type="text"],
+        .ec-group input[type="number"] {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 10px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+        }
+        .ec-group input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+        .ec-toggles { gap: 0; }
+        .ec-toggles .toggle-label {
+            display: inline-block;
+            margin-left: 10px;
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            text-transform: none;
+            letter-spacing: 0;
+        }
+        .ec-actions {
+            justify-content: flex-end;
+            align-items: flex-end;
+        }
+        .ec-actions .btn { width: 100%; }
+
         /* Textarea */
         .email-textarea {
             width: 100%;
@@ -882,6 +1047,83 @@ HTML = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- Engine Configuration Panel -->
+        <details id="engineConfig" class="engine-config" open>
+            <summary>🔧 Validation Engine — click to expand & customize</summary>
+            <div class="engine-config-grid">
+
+                <div class="ec-group">
+                    <label for="portsInput">SMTP Ports
+                        <span class="ec-hint">comma-separated, tried in order</span>
+                    </label>
+                    <input id="portsInput" type="text" value="25,587" placeholder="25,587">
+                </div>
+
+                <div class="ec-group">
+                    <label for="smtpTimeoutInput">SMTP Timeout (sec)
+                        <span class="ec-hint">per probe connection</span>
+                    </label>
+                    <input id="smtpTimeoutInput" type="number" min="2" max="60" step="1" value="10">
+                </div>
+
+                <div class="ec-group">
+                    <label for="minIntervalInput">Per-Domain Rate Limit (sec)
+                        <span class="ec-hint">min seconds between probes to the same domain</span>
+                    </label>
+                    <input id="minIntervalInput" type="number" min="0" max="5" step="0.05" value="0.15">
+                </div>
+
+                <div class="ec-group">
+                    <label for="dnsTimeoutInput">DNS Timeout (sec)
+                        <span class="ec-hint">dnspython resolver.timeout</span>
+                    </label>
+                    <input id="dnsTimeoutInput" type="number" min="1" max="30" step="0.5" value="3">
+                </div>
+
+                <div class="ec-group">
+                    <label for="dnsLifetimeInput">DNS Lifetime (sec)
+                        <span class="ec-hint">dnspython resolver.lifetime</span>
+                    </label>
+                    <input id="dnsLifetimeInput" type="number" min="1" max="30" step="0.5" value="5">
+                </div>
+
+                <div class="ec-group ec-toggles">
+                    <label class="toggle">
+                        <input type="checkbox" id="useAFallbackCheck" checked>
+                        <span class="toggle-track"></span>
+                        <span class="toggle-knob"></span>
+                    </label>
+                    <span class="toggle-label">Fall back to A-record if no MX</span>
+
+                    <label class="toggle" style="margin-top:10px">
+                        <input type="checkbox" id="skipSyntaxCheck">
+                        <span class="toggle-track"></span>
+                        <span class="toggle-knob"></span>
+                    </label>
+                    <span class="toggle-label">Skip syntax check (trust input)</span>
+
+                    <label class="toggle" style="margin-top:10px">
+                        <input type="checkbox" id="knownBlockerCheck" checked>
+                        <span class="toggle-track"></span>
+                        <span class="toggle-knob"></span>
+                    </label>
+                    <span class="toggle-label">Mark probe-blocking providers as likely_valid</span>
+
+                    <label class="toggle" style="margin-top:10px">
+                        <input type="checkbox" id="autoRetryCheck" checked>
+                        <span class="toggle-track"></span>
+                        <span class="toggle-knob"></span>
+                    </label>
+                    <span class="toggle-label">Auto-retry undetermined emails</span>
+                </div>
+
+                <div class="ec-group ec-actions">
+                    <button id="resetConfigBtn" class="btn btn-load" type="button">↺ Reset to Defaults</button>
+                </div>
+
+            </div>
+        </details>
+
         <textarea id="emailsInput" class="email-textarea" rows="8"
             placeholder="Paste emails here (one per line) or click Load File to import email_list.txt&#10;&#10;Supports formats: email@example.com, email:password, email,name"></textarea>
         <div id="emailCount" class="email-count">No emails loaded</div>
@@ -1117,10 +1359,49 @@ function resetUI() {
 }
 
 // Start validation
+const ENGINE_DEFAULTS = {
+    ports: '25,587',
+    smtp_timeout: 10,
+    min_interval: 0.15,
+    dns_timeout: 3,
+    dns_lifetime: 5,
+    use_a_fallback: true,
+    skip_syntax: false,
+    known_blocker_fallback: true,
+    auto_retry: true,
+};
+
+function readEngineConfig() {
+    return {
+        ports: $('portsInput').value.trim() || ENGINE_DEFAULTS.ports,
+        smtp_timeout: parseFloat($('smtpTimeoutInput').value) || ENGINE_DEFAULTS.smtp_timeout,
+        min_interval: parseFloat($('minIntervalInput').value) || ENGINE_DEFAULTS.min_interval,
+        dns_timeout: parseFloat($('dnsTimeoutInput').value) || ENGINE_DEFAULTS.dns_timeout,
+        dns_lifetime: parseFloat($('dnsLifetimeInput').value) || ENGINE_DEFAULTS.dns_lifetime,
+        use_a_fallback: $('useAFallbackCheck').checked ? 1 : 0,
+        skip_syntax: $('skipSyntaxCheck').checked ? 1 : 0,
+        known_blocker_fallback: $('knownBlockerCheck').checked ? 1 : 0,
+        auto_retry: $('autoRetryCheck').checked ? 1 : 0,
+    };
+}
+
+$('resetConfigBtn').addEventListener('click', function() {
+    $('portsInput').value = ENGINE_DEFAULTS.ports;
+    $('smtpTimeoutInput').value = ENGINE_DEFAULTS.smtp_timeout;
+    $('minIntervalInput').value = ENGINE_DEFAULTS.min_interval;
+    $('dnsTimeoutInput').value = ENGINE_DEFAULTS.dns_timeout;
+    $('dnsLifetimeInput').value = ENGINE_DEFAULTS.dns_lifetime;
+    $('useAFallbackCheck').checked = ENGINE_DEFAULTS.use_a_fallback;
+    $('skipSyntaxCheck').checked = ENGINE_DEFAULTS.skip_syntax;
+    $('knownBlockerCheck').checked = ENGINE_DEFAULTS.known_blocker_fallback;
+    $('autoRetryCheck').checked = ENGINE_DEFAULTS.auto_retry;
+});
+
 $('startBtn').addEventListener('click', function() {
     const inputText = $('emailsInput').value.trim();
     const workers = parseInt($('workersInput').value) || 20;
     const catchAll = $('catchAllCheck').checked ? 1 : 0;
+    const ec = readEngineConfig();
 
     if (!inputText) {
         alert('Please paste emails or load email_list.txt first.');
@@ -1145,7 +1426,7 @@ $('startBtn').addEventListener('click', function() {
     // UI state
     this.disabled = true;
     this.style.display = 'none';
-    $('cancelBtn').style.display = '';
+    $('cancelBtn').style.display = 'inline';
     $('cancelBtn').disabled = false;
     $('cancelBtn').classList.remove('cancelling');
     $('cancelBtn').textContent = '⏹ Cancel';
@@ -1161,12 +1442,35 @@ $('startBtn').addEventListener('click', function() {
     startSpeedTracker();
 
     // POST the data to start validation
+    const params = new URLSearchParams();
+    params.set('workers', workers);
+    params.set('catch_all', catchAll);
+    params.set('session_id', currentSessionId);
+    params.set('data', inputText);
+    params.set('ports', ec.ports);
+    params.set('smtp_timeout', ec.smtp_timeout);
+    params.set('min_interval', ec.min_interval);
+    params.set('dns_timeout', ec.dns_timeout);
+    params.set('dns_lifetime', ec.dns_lifetime);
+    params.set('use_a_fallback', ec.use_a_fallback);
+    params.set('skip_syntax', ec.skip_syntax);
+    params.set('known_blocker_fallback', ec.known_blocker_fallback);
+    params.set('auto_retry', ec.auto_retry);
+
+    // Log the active config so users can see what they picked
+    $('logConsole').innerHTML =
+        '<div class="log-system">⚙ Engine config: ' +
+        'ports=[' + ec.ports + '], timeout=' + ec.smtp_timeout + 's, ' +
+        'rate=' + ec.min_interval + 's, dns=' + ec.dns_timeout + '/' + ec.dns_lifetime + 's, ' +
+        'A-fallback=' + (ec.use_a_fallback ? 'on' : 'off') + ', ' +
+        'skip-syntax=' + (ec.skip_syntax ? 'on' : 'off') + ', ' +
+        'blocker-fallback=' + (ec.known_blocker_fallback ? 'on' : 'off') + ', ' +
+        'auto-retry=' + (ec.auto_retry ? 'on' : 'off') + '</div>';
+
     fetch('/sort_emails', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: 'workers=' + workers + '&catch_all=' + catchAll +
-              '&session_id=' + encodeURIComponent(currentSessionId) +
-              '&data=' + encodeURIComponent(inputText)
+        body: params.toString()
     }).then(response => {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -1346,16 +1650,38 @@ def cancel_validation():
 @app.route("/sort_emails", methods=["GET", "POST"])
 def sort_emails():
     """SSE endpoint: stream per-email results as they complete."""
-    if request.method == "POST":
-        raw_data = request.form.get("data", "").strip()
-        workers = max(1, min(50, int(request.form.get("workers", "20") or "20")))
-        detect_catch = request.form.get("catch_all", "1") == "1"
-        session_id = request.form.get("session_id", str(uuid.uuid4()))
-    else:
-        raw_data = request.args.get("data", "").strip()
-        workers = max(1, min(50, int(request.args.get("workers", "20") or "20")))
-        detect_catch = request.args.get("catch_all", "1") == "1"
-        session_id = request.args.get("session_id", str(uuid.uuid4()))
+    src = request.form if request.method == "POST" else request.args
+    raw_data = src.get("data", "").strip()
+    workers = max(1, min(50, int(src.get("workers", "20") or "20")))
+    detect_catch = src.get("catch_all", "1") == "1"
+    session_id = src.get("session_id", str(uuid.uuid4()))
+
+    # --- User-defined validation engine configuration ---
+    def _f(key, default):
+        try:
+            return float(src.get(key, default))
+        except (TypeError, ValueError):
+            return default
+    def _i(key, default):
+        try:
+            return int(src.get(key, default))
+        except (TypeError, ValueError):
+            return default
+    def _b(key, default):
+        v = src.get(key, "1" if default else "0")
+        return v in ("1", "true", "True", "yes", "on")
+
+    cfg = {
+        "timeout": _i("smtp_timeout", 10),
+        "min_interval": _f("min_interval", DEFAULT_RATE_INTERVAL),
+        "ports": _parse_ports(src.get("ports", "25,587")),
+        "use_a_fallback": _b("use_a_fallback", True),
+        "skip_syntax": _b("skip_syntax", False),
+        "known_blocker_fallback": _b("known_blocker_fallback", True),
+        "dns_timeout": _f("dns_timeout", DEFAULT_DNS_TIMEOUT),
+        "dns_lifetime": _f("dns_lifetime", DEFAULT_DNS_LIFETIME),
+        "auto_retry": _b("auto_retry", True),
+    }
 
     # Fall back to email_list.txt if no data was passed
     if not raw_data:
@@ -1436,16 +1762,19 @@ def sort_emails():
         yield f"data: {json.dumps({'type': 'dns_prewarm', 'domains': len(all_domains)})}\n\n"
 
         dns_start = time.time()
-        prewarm_mx_cache(all_domains, max_workers=min(30, len(all_domains)))
+        prewarm_mx_cache(all_domains, max_workers=min(30, len(all_domains)),
+                          use_a_fallback=cfg["use_a_fallback"],
+                          dns_timeout=cfg["dns_timeout"],
+                          dns_lifetime=cfg["dns_lifetime"])
         dns_elapsed = round(time.time() - dns_start, 1)
-        yield f"data: {json.dumps({'type': 'dns_done', 'elapsed': dns_elapsed})}\n\n"
+        yield f"data: {json.dumps({'type': 'dns_done', 'elapsed': dns_elapsed, 'config': cfg})}\n\n"
 
         if cancel_event.is_set():
             yield f"data: {json.dumps({'type': 'cancelled', 'summary': {**counts, 'total': 0}})}\n\n"
             return
 
         def task(email):
-            return email, *verify_email(email, detect_catch_all=detect_catch)
+            return email, *verify_email(email, detect_catch_all=detect_catch, cfg=cfg)
 
         completed = 0
         undetermined_emails = []
@@ -1495,8 +1824,8 @@ def sort_emails():
         if cancel_event.is_set():
             yield f"data: {json.dumps({'type': 'cancelled', 'summary': {**counts, 'total': completed}})}\n\n"
         else:
-            # Auto-retry undetermined emails (one pass)
-            if undetermined_emails and not cancel_event.is_set():
+            # Auto-retry undetermined emails (one pass) — only if user enabled it
+            if cfg.get("auto_retry", True) and undetermined_emails and not cancel_event.is_set():
                 yield f"data: {json.dumps({'type': 'retry_start', 'count': len(undetermined_emails)})}\n\n"
 
                 # Remove undetermined emails from output file before retry
@@ -1512,9 +1841,9 @@ def sort_emails():
                     except Exception:
                         pass
 
-                # Retry with different strategy (reverse port order)
+                # Retry with the same config
                 def retry_task(email):
-                    return email, *verify_email(email, detect_catch_all=detect_catch)
+                    return email, *verify_email(email, detect_catch_all=detect_catch, cfg=cfg)
 
                 retry_completed = 0
                 with ThreadPoolExecutor(max_workers=min(workers, len(undetermined_emails)), thread_name_prefix="retry") as pool:
